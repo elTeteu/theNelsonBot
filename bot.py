@@ -1,12 +1,29 @@
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 from groq import Groq
 
 groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
+# Dummy web server to keep Render happy
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+
+threading.Thread(target=run_web_server, daemon=True).start()
+
+# Telegram bot
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Work in private chats OR when mentioned/replied to in groups
     msg = update.message
     if not msg or not msg.text:
         return
@@ -33,4 +50,4 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 app = ApplicationBuilder().token(os.environ["TELEGRAM_TOKEN"]).build()
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-app.run_polling()
+app.run_polling(drop_pending_updates=True)
