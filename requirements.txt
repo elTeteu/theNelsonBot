@@ -4,3 +4,4 @@ yfinance
 requests
 duckduckgo-search
 fredapi
+numpy
