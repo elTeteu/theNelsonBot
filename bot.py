@@ -3,6 +3,7 @@ import threading
 import requests
 import yfinance as yf
 import numpy as np
+from datetime import datetime, timedelta
 from fredapi import Fred
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
@@ -12,7 +13,8 @@ from duckduckgo_search import DDGS
 
 groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 NEWS_API_KEY = os.environ["NEWS_API_KEY"]
-fred = Fred(api_key=os.environ["FRED_API_KEY"])
+FRED_API_KEY = os.environ["FRED_API_KEY"]
+fred = Fred(api_key=FRED_API_KEY)
 
 # Dummy web server to keep Render happy
 class HealthHandler(BaseHTTPRequestHandler):
@@ -56,7 +58,6 @@ def run_dcf(ticker: str) -> str:
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
-
         current_price = info.get("currentPrice") or info.get("regularMarketPrice")
         shares_outstanding = info.get("sharesOutstanding")
         free_cash_flow = info.get("freeCashflow")
@@ -71,17 +72,13 @@ def run_dcf(ticker: str) -> str:
         risk_free_rate = 0.045
         equity_risk_premium = 0.055
         wacc = risk_free_rate + beta * equity_risk_premium
-
         growth_rate_5y = min(max(revenue_growth, 0.03), 0.25)
         terminal_growth = 0.025
 
         projected_fcf = []
         fcf = free_cash_flow
         for year in range(1, 11):
-            if year <= 5:
-                growth = growth_rate_5y
-            else:
-                growth = growth_rate_5y - (growth_rate_5y - terminal_growth) * ((year - 5) / 5)
+            growth = growth_rate_5y if year <= 5 else growth_rate_5y - (growth_rate_5y - terminal_growth) * ((year - 5) / 5)
             fcf = fcf * (1 + growth)
             projected_fcf.append(fcf)
 
@@ -92,7 +89,6 @@ def run_dcf(ticker: str) -> str:
         enterprise_value = sum(pv_fcfs) + pv_terminal
         equity_value = enterprise_value + total_cash - total_debt
         intrinsic_value_per_share = equity_value / shares_outstanding
-
         upside = ((intrinsic_value_per_share - current_price) / current_price) * 100
         verdict = "UNDERVALUED 🟢" if upside > 10 else "OVERVALUED 🔴" if upside < -10 else "FAIRLY VALUED 🟡"
 
@@ -145,20 +141,16 @@ def get_crypto_price(coin_input: str) -> str:
             "sui": "sui", "monero": "monero", "xmr": "monero",
             "pax gold": "pax-gold", "paxg": "pax-gold",
         }
-
         coin_lower = coin_input.lower().strip()
         coin_id = alias_map.get(coin_lower) or search_coingecko_id(coin_lower)
-
         if not coin_id:
             return f"Could not find crypto: {coin_input}"
-
         url = (
             f"https://api.coingecko.com/api/v3/simple/price"
             f"?ids={coin_id}&vs_currencies=usd"
             f"&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true"
         )
         data = requests.get(url, timeout=10).json()
-
         if coin_id in data:
             c = data[coin_id]
             change = c.get("usd_24h_change", 0) or 0
@@ -199,6 +191,65 @@ def web_search(query: str) -> str:
     except Exception as e:
         return f"Error searching web: {e}"
 
+def get_economic_calendar(when: str = "today") -> str:
+    """Fetch US economic data releases from FRED + web search for forecasts."""
+    try:
+        today = datetime.utcnow().date()
+        if "tomorrow" in when:
+            start_date = end_date = today + timedelta(days=1)
+            label = (today + timedelta(days=1)).strftime("%A, %B %d, %Y")
+        elif "week" in when:
+            start_date = today
+            end_date = today + timedelta(days=7)
+            label = f"this week ({start_date} to {end_date})"
+        elif "yesterday" in when:
+            start_date = end_date = today - timedelta(days=1)
+            label = (today - timedelta(days=1)).strftime("%A, %B %d, %Y")
+        else:
+            start_date = end_date = today
+            label = today.strftime("%A, %B %d, %Y")
+
+        url = (
+            f"https://api.stlouisfed.org/fred/releases/dates"
+            f"?api_key={FRED_API_KEY}&file_type=json"
+            f"&realtime_start={start_date.strftime('%Y-%m-%d')}"
+            f"&realtime_end={end_date.strftime('%Y-%m-%d')}"
+            f"&include_release_dates_with_no_data=false&limit=1000"
+        )
+        response = requests.get(url, timeout=15)
+        data = response.json()
+
+        if "error_message" in data:
+            return f"FRED API error: {data['error_message']}"
+
+        release_dates = data.get("release_dates", [])
+
+        output = f"📅 US Economic Data Releases — {label}:\n\n"
+
+        if release_dates:
+            seen = set()
+            for r in release_dates[:30]:
+                rname = r.get("release_name", "Unknown")
+                rdate = r.get("date", "")
+                key = (rname, rdate)
+                if key not in seen:
+                    seen.add(key)
+                    output += f"• {rdate} — {rname}\n"
+        else:
+            output += "(No FRED releases found for this date range — may be weekend or holiday)\n"
+
+        output += "\n--- Forecast, consensus & actual values from the web ---\n"
+        if "tomorrow" in when:
+            output += web_search("US economic calendar tomorrow high impact forecast consensus")
+        elif "week" in when:
+            output += web_search("US economic calendar this week high impact forecast consensus")
+        else:
+            output += web_search(f"US economic data released today {today.strftime('%B %d %Y')} forecast consensus actual")
+
+        return output
+    except Exception as e:
+        return f"Error fetching economic calendar: {e}"
+
 def get_fred_data(indicator: str) -> str:
     fred_map = {
         "cpi": "CPIAUCSL", "inflation": "CPIAUCSL",
@@ -217,15 +268,12 @@ def get_fred_data(indicator: str) -> str:
         "consumer sentiment": "UMCSENT",
         "consumer confidence": "CSCICP03USM665S",
     }
-
     series_id = None
     indicator_lower = indicator.lower()
-
     for key, sid in fred_map.items():
         if key in indicator_lower:
             series_id = sid
             break
-
     if not series_id:
         try:
             search_results = fred.search(indicator, limit=1)
@@ -235,7 +283,6 @@ def get_fred_data(indicator: str) -> str:
                 return f"Could not find FRED data for: {indicator}"
         except Exception as e:
             return f"FRED search error: {e}"
-
     try:
         series = fred.get_series(series_id).dropna().tail(6)
         info = fred.get_series_info(series_id)
@@ -289,6 +336,26 @@ def detect_and_fetch(message: str) -> str:
     msg = message.lower()
     context = ""
 
+    # Economic calendar detection
+    calendar_keywords = [
+        "economic calendar", "data releases", "data release",
+        "released today", "release today", "today's data",
+        "this week's data", "data this week", "data tomorrow",
+        "economic events", "upcoming data", "scheduled releases",
+        "data being released", "what data", "economic data today",
+        "economic data this week", "economic data tomorrow",
+        "us economic releases", "us data releases"
+    ]
+    if any(k in msg for k in calendar_keywords):
+        if "tomorrow" in msg:
+            context += get_economic_calendar("tomorrow") + "\n\n"
+        elif "week" in msg:
+            context += get_economic_calendar("week") + "\n\n"
+        elif "yesterday" in msg:
+            context += get_economic_calendar("yesterday") + "\n\n"
+        else:
+            context += get_economic_calendar("today") + "\n\n"
+
     # DCF detection
     dcf_keywords = ["dcf", "discounted cash flow", "intrinsic value", "fair value",
                     "valuation of", "value of", "is it overvalued", "is it undervalued",
@@ -326,7 +393,7 @@ def detect_and_fetch(message: str) -> str:
         if coin:
             context += get_crypto_price(coin) + "\n\n"
 
-    # ISM PMI special handling — multi-source web search
+    # ISM PMI special handling
     pmi_keywords = ["pmi", "ism", "purchasing managers", "manufacturing index", "services index"]
     if any(k in msg for k in pmi_keywords):
         if "service" in msg:
@@ -344,7 +411,7 @@ def detect_and_fetch(message: str) -> str:
     fred_keywords = [
         "cpi", "inflation", "gdp", "unemployment", "fed funds", "interest rate",
         "payroll", "nfp", "jobs", "housing", "retail sales", "yield", "pce",
-        "m2", "money supply", "trade balance", "consumer sentiment", "economic",
+        "m2", "money supply", "trade balance", "consumer sentiment",
         "macro", "federal reserve", "recession", "10 year", "2 year", "treasury"
     ]
     if any(k in msg for k in fred_keywords):
@@ -353,10 +420,10 @@ def detect_and_fetch(message: str) -> str:
     # News detection
     news_keywords = ["news", "latest", "headline", "update", "report",
                      "announced", "today", "recently"]
-    if any(k in msg for k in news_keywords):
+    if any(k in msg for k in news_keywords) and "calendar" not in msg and "release" not in msg:
         context += get_news(message) + "\n\n"
 
-    # Web search
+    # Web search fallback
     search_keywords = ["what is", "who is", "how", "why", "when", "where",
                        "explain", "tell me about", "search"]
     if not context or any(k in msg for k in search_keywords):
@@ -393,7 +460,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "When live data is provided, use it to give accurate, up-to-date answers. "
         "For DCF valuations, the Python code has already calculated the intrinsic value — "
         "present the results clearly, explain the assumptions, and give a buy/hold/sell opinion. "
-        "For economic questions, interpret the data clearly and mention trends. "
+        "For economic calendar questions, list the scheduled releases clearly with names and dates. "
         "For ISM PMI, always mention actual, forecast, consensus and previous values if available. "
         "For crypto, always mention price, 24h change and market cap. "
         "Be concise but thorough. Use bullet points where helpful."
