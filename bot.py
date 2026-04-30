@@ -2,6 +2,7 @@ import os
 import threading
 import requests
 import yfinance as yf
+import numpy as np
 from fredapi import Fred
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
@@ -51,8 +52,84 @@ def get_stock_data(ticker: str) -> str:
     except Exception as e:
         return f"Error fetching stock data: {e}"
 
+def run_dcf(ticker: str) -> str:
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+
+        # Get key financials
+        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+        shares_outstanding = info.get("sharesOutstanding")
+        free_cash_flow = info.get("freeCashflow")
+        total_cash = info.get("totalCash", 0)
+        total_debt = info.get("totalDebt", 0)
+        revenue_growth = info.get("revenueGrowth") or 0.08
+        beta = info.get("beta") or 1.0
+
+        if not all([current_price, shares_outstanding, free_cash_flow]):
+            return f"Insufficient financial data for DCF on {ticker.upper()}."
+
+        # DCF Assumptions
+        risk_free_rate = 0.045        # 10Y Treasury ~4.5%
+        equity_risk_premium = 0.055   # Historical ERP
+        wacc = risk_free_rate + beta * equity_risk_premium
+
+        # Growth rates
+        growth_rate_5y = min(max(revenue_growth, 0.03), 0.25)  # cap 3%-25%
+        terminal_growth = 0.025  # Long-term GDP growth
+
+        # Project FCF for 10 years (5y high growth + 5y declining)
+        projected_fcf = []
+        fcf = free_cash_flow
+        for year in range(1, 11):
+            if year <= 5:
+                growth = growth_rate_5y
+            else:
+                # Linearly decline from growth_rate_5y to terminal_growth
+                growth = growth_rate_5y - (growth_rate_5y - terminal_growth) * ((year - 5) / 5)
+            fcf = fcf * (1 + growth)
+            projected_fcf.append(fcf)
+
+        # Discount FCFs to present value
+        pv_fcfs = [cf / (1 + wacc) ** (i + 1) for i, cf in enumerate(projected_fcf)]
+
+        # Terminal value (Gordon Growth Model)
+        terminal_value = projected_fcf[-1] * (1 + terminal_growth) / (wacc - terminal_growth)
+        pv_terminal = terminal_value / (1 + wacc) ** 10
+
+        # Intrinsic value
+        enterprise_value = sum(pv_fcfs) + pv_terminal
+        equity_value = enterprise_value + total_cash - total_debt
+        intrinsic_value_per_share = equity_value / shares_outstanding
+
+        # Margin of safety
+        upside = ((intrinsic_value_per_share - current_price) / current_price) * 100
+        verdict = "UNDERVALUED 🟢" if upside > 10 else "OVERVALUED 🔴" if upside < -10 else "FAIRLY VALUED 🟡"
+
+        return (
+            f"DCF Valuation: {info.get('longName', ticker)} ({ticker.upper()})\n\n"
+            f"📊 Inputs:\n"
+            f"  Current FCF: ${free_cash_flow:,}\n"
+            f"  5Y Growth Rate: {growth_rate_5y*100:.1f}%\n"
+            f"  Terminal Growth: {terminal_growth*100:.1f}%\n"
+            f"  WACC: {wacc*100:.1f}% (Beta: {beta:.2f})\n"
+            f"  Cash: ${total_cash:,}\n"
+            f"  Debt: ${total_debt:,}\n\n"
+            f"📈 Results:\n"
+            f"  PV of FCFs: ${sum(pv_fcfs):,.0f}\n"
+            f"  PV of Terminal Value: ${pv_terminal:,.0f}\n"
+            f"  Enterprise Value: ${enterprise_value:,.0f}\n"
+            f"  Equity Value: ${equity_value:,.0f}\n\n"
+            f"💡 Conclusion:\n"
+            f"  Intrinsic Value/Share: ${intrinsic_value_per_share:.2f}\n"
+            f"  Current Price: ${current_price:.2f}\n"
+            f"  Upside/Downside: {upside:+.1f}%\n"
+            f"  Verdict: {verdict}"
+        )
+    except Exception as e:
+        return f"Error running DCF for {ticker}: {e}"
+
 def search_coingecko_id(coin_name: str) -> str | None:
-    """Search CoinGecko for a coin ID by name or symbol."""
     try:
         url = f"https://api.coingecko.com/api/v3/search?query={coin_name}"
         data = requests.get(url, timeout=10).json()
@@ -64,9 +141,7 @@ def search_coingecko_id(coin_name: str) -> str | None:
         return None
 
 def get_crypto_price(coin_input: str) -> str:
-    """Fetch crypto price dynamically — works for any coin on CoinGecko."""
     try:
-        # Common name/symbol aliases to CoinGecko IDs
         alias_map = {
             "btc": "bitcoin", "eth": "ethereum", "sol": "solana",
             "bnb": "binancecoin", "xrp": "ripple", "ada": "cardano",
@@ -77,17 +152,12 @@ def get_crypto_price(coin_input: str) -> str:
             "chainlink": "chainlink",
             "bittensor": "bittensor", "tao": "bittensor",
             "hyperliquid": "hyperliquid", "hype": "hyperliquid",
-            "sui": "sui",
-            "monero": "monero", "xmr": "monero",
+            "sui": "sui", "monero": "monero", "xmr": "monero",
             "pax gold": "pax-gold", "paxg": "pax-gold",
         }
 
         coin_lower = coin_input.lower().strip()
-        coin_id = alias_map.get(coin_lower)
-
-        # If not in alias map, search CoinGecko dynamically
-        if not coin_id:
-            coin_id = search_coingecko_id(coin_lower)
+        coin_id = alias_map.get(coin_lower) or search_coingecko_id(coin_lower)
 
         if not coin_id:
             return f"Could not find crypto: {coin_input}"
@@ -202,10 +272,8 @@ def get_fred_data(indicator: str) -> str:
         return f"Error fetching FRED series {series_id}: {e}"
 
 def detect_crypto_in_message(message: str) -> str | None:
-    """Extract crypto name/symbol from message using common patterns."""
+    import re
     msg = message.lower()
-
-    # Known names and symbols to check
     known = [
         "bitcoin", "btc", "ethereum", "eth", "solana", "sol",
         "bnb", "xrp", "cardano", "ada", "dogecoin", "doge",
@@ -214,54 +282,61 @@ def detect_crypto_in_message(message: str) -> str | None:
         "polkadot", "dot", "avalanche", "avax", "uniswap", "uni",
         "litecoin", "ltc", "cosmos", "atom", "stellar", "xlm",
     ]
-
     for name in known:
         if name in msg:
             return name
-
-    # Try to detect by context: "price of X" or "X price" or "X coin"
-    import re
     patterns = [
-        r"price of ([a-z]+)",
-        r"([a-z]+) price",
-        r"([a-z]+) coin",
-        r"([a-z]+) token",
-        r"([a-z]+) crypto",
-        r"how much is ([a-z]+)",
-        r"what is ([a-z]+) trading at",
+        r"price of ([a-z]+)", r"([a-z]+) price",
+        r"([a-z]+) coin", r"([a-z]+) token",
+        r"how much is ([a-z]+)", r"what is ([a-z]+) trading at",
     ]
     for pattern in patterns:
         match = re.search(pattern, msg)
         if match:
             candidate = match.group(1)
-            # Filter out common non-crypto words
-            ignore = {"the", "a", "an", "this", "that", "what", "how", "is", "are"}
+            ignore = {"the", "a", "an", "this", "that", "what", "how", "is", "are", "stock"}
             if candidate not in ignore and len(candidate) >= 2:
                 return candidate
-
     return None
 
 def detect_and_fetch(message: str) -> str:
+    import re
     msg = message.lower()
     context = ""
 
+    # DCF detection — run actual DCF calculation
+    dcf_keywords = ["dcf", "discounted cash flow", "intrinsic value", "fair value",
+                    "valuation of", "value of", "is it overvalued", "is it undervalued",
+                    "worth buying", "margin of safety"]
+    if any(k in msg for k in dcf_keywords):
+        words = message.split()
+        for word in words:
+            clean = word.strip("$?,.")
+            if clean.isupper() and 1 <= len(clean) <= 5:
+                context += run_dcf(clean) + "\n\n"
+                break
+        # Also try regex for ticker patterns
+        if not context:
+            match = re.search(r'\b([A-Z]{1,5})\b', message)
+            if match:
+                context += run_dcf(match.group(1)) + "\n\n"
+
     # Stock detection
-    stock_keywords = ["stock", "share", "ticker", "price of", "p/e", "dcf",
-                      "valuation", "market cap", "eps", "revenue"]
-    words = message.split()
+    stock_keywords = ["stock", "share", "ticker", "price of", "p/e",
+                      "market cap", "eps", "revenue"]
     if any(k in msg for k in stock_keywords):
+        words = message.split()
         for word in words:
             clean = word.strip("$?,.")
             if clean.isupper() and 1 <= len(clean) <= 5:
                 context += get_stock_data(clean) + "\n\n"
                 break
 
-    # Crypto detection — dynamic, works for any coin
+    # Crypto detection
     crypto_keywords = ["crypto", "coin", "token", "bitcoin", "ethereum", "solana",
-                       "price of", "trading at", "zcash", "chainlink", "bittensor",
-                       "hyperliquid", "sui", "monero", "pax gold", "btc", "eth",
-                       "bnb", "xrp", "doge", "sol", "link", "tao", "hype", "xmr",
-                       "zec", "paxg", "ada", "dot", "avax", "ltc"]
+                       "zcash", "chainlink", "bittensor", "hyperliquid", "sui",
+                       "monero", "pax gold", "btc", "eth", "bnb", "xrp", "doge",
+                       "sol", "link", "tao", "hype", "xmr", "zec", "paxg", "ada"]
     if any(k in msg for k in crypto_keywords):
         coin = detect_crypto_in_message(message)
         if coin:
@@ -293,8 +368,8 @@ def detect_and_fetch(message: str) -> str:
         context += get_fred_data(message) + "\n\n"
 
     # News detection
-    news_keywords = ["news", "latest", "headline", "update", "report", "announced",
-                     "today", "recently"]
+    news_keywords = ["news", "latest", "headline", "update", "report",
+                     "announced", "today", "recently"]
     if any(k in msg for k in news_keywords):
         context += get_news(message) + "\n\n"
 
@@ -333,7 +408,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     system_prompt = (
         "You are a powerful financial and economic assistant with access to live market data. "
         "When live data is provided, use it to give accurate, up-to-date answers. "
-        "For DCF valuations, use provided financials with standard assumptions (WACC, growth rates). "
+        "For DCF valuations, the Python code has already calculated the intrinsic value — "
+        "present the results clearly, explain the assumptions, and give a buy/hold/sell opinion. "
         "For economic questions, interpret the data clearly and mention trends. "
         "For ISM PMI, always mention actual, forecast, consensus and previous values if available. "
         "For crypto, always mention price, 24h change and market cap. "
