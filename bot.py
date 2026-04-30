@@ -57,7 +57,6 @@ def run_dcf(ticker: str) -> str:
         stock = yf.Ticker(ticker)
         info = stock.info
 
-        # Get key financials
         current_price = info.get("currentPrice") or info.get("regularMarketPrice")
         shares_outstanding = info.get("sharesOutstanding")
         free_cash_flow = info.get("freeCashflow")
@@ -69,40 +68,31 @@ def run_dcf(ticker: str) -> str:
         if not all([current_price, shares_outstanding, free_cash_flow]):
             return f"Insufficient financial data for DCF on {ticker.upper()}."
 
-        # DCF Assumptions
-        risk_free_rate = 0.045        # 10Y Treasury ~4.5%
-        equity_risk_premium = 0.055   # Historical ERP
+        risk_free_rate = 0.045
+        equity_risk_premium = 0.055
         wacc = risk_free_rate + beta * equity_risk_premium
 
-        # Growth rates
-        growth_rate_5y = min(max(revenue_growth, 0.03), 0.25)  # cap 3%-25%
-        terminal_growth = 0.025  # Long-term GDP growth
+        growth_rate_5y = min(max(revenue_growth, 0.03), 0.25)
+        terminal_growth = 0.025
 
-        # Project FCF for 10 years (5y high growth + 5y declining)
         projected_fcf = []
         fcf = free_cash_flow
         for year in range(1, 11):
             if year <= 5:
                 growth = growth_rate_5y
             else:
-                # Linearly decline from growth_rate_5y to terminal_growth
                 growth = growth_rate_5y - (growth_rate_5y - terminal_growth) * ((year - 5) / 5)
             fcf = fcf * (1 + growth)
             projected_fcf.append(fcf)
 
-        # Discount FCFs to present value
         pv_fcfs = [cf / (1 + wacc) ** (i + 1) for i, cf in enumerate(projected_fcf)]
-
-        # Terminal value (Gordon Growth Model)
         terminal_value = projected_fcf[-1] * (1 + terminal_growth) / (wacc - terminal_growth)
         pv_terminal = terminal_value / (1 + wacc) ** 10
 
-        # Intrinsic value
         enterprise_value = sum(pv_fcfs) + pv_terminal
         equity_value = enterprise_value + total_cash - total_debt
         intrinsic_value_per_share = equity_value / shares_outstanding
 
-        # Margin of safety
         upside = ((intrinsic_value_per_share - current_price) / current_price) * 100
         verdict = "UNDERVALUED 🟢" if upside > 10 else "OVERVALUED 🔴" if upside < -10 else "FAIRLY VALUED 🟡"
 
@@ -129,7 +119,7 @@ def run_dcf(ticker: str) -> str:
     except Exception as e:
         return f"Error running DCF for {ticker}: {e}"
 
-def search_coingecko_id(coin_name: str) -> str | None:
+def search_coingecko_id(coin_name: str):
     try:
         url = f"https://api.coingecko.com/api/v3/search?query={coin_name}"
         data = requests.get(url, timeout=10).json()
@@ -226,11 +216,6 @@ def get_fred_data(indicator: str) -> str:
         "trade balance": "BOPGSTB", "retail sales": "RSAFS",
         "consumer sentiment": "UMCSENT",
         "consumer confidence": "CSCICP03USM665S",
-        "ism manufacturing": "NAPM", "manufacturing pmi": "NAPM",
-        "ism pmi": "NAPM", "pmi manufacturing": "NAPM",
-        "ism services": "NMFCI", "services pmi": "NMFCI",
-        "pmi services": "NMFCI", "non-manufacturing": "NMFCI",
-        "nonmanufacturing": "NMFCI", "pmi": "NAPM",
     }
 
     series_id = None
@@ -271,7 +256,7 @@ def get_fred_data(indicator: str) -> str:
     except Exception as e:
         return f"Error fetching FRED series {series_id}: {e}"
 
-def detect_crypto_in_message(message: str) -> str | None:
+def detect_crypto_in_message(message: str):
     import re
     msg = message.lower()
     known = [
@@ -304,7 +289,7 @@ def detect_and_fetch(message: str) -> str:
     msg = message.lower()
     context = ""
 
-    # DCF detection — run actual DCF calculation
+    # DCF detection
     dcf_keywords = ["dcf", "discounted cash flow", "intrinsic value", "fair value",
                     "valuation of", "value of", "is it overvalued", "is it undervalued",
                     "worth buying", "margin of safety"]
@@ -315,7 +300,6 @@ def detect_and_fetch(message: str) -> str:
             if clean.isupper() and 1 <= len(clean) <= 5:
                 context += run_dcf(clean) + "\n\n"
                 break
-        # Also try regex for ticker patterns
         if not context:
             match = re.search(r'\b([A-Z]{1,5})\b', message)
             if match:
@@ -342,20 +326,19 @@ def detect_and_fetch(message: str) -> str:
         if coin:
             context += get_crypto_price(coin) + "\n\n"
 
-    # ISM PMI special handling
+    # ISM PMI special handling — multi-source web search
     pmi_keywords = ["pmi", "ism", "purchasing managers", "manufacturing index", "services index"]
     if any(k in msg for k in pmi_keywords):
         if "service" in msg:
-            context += get_fred_data("ism services pmi") + "\n\n"
-            search_query = "ISM Services PMI forecast consensus actual latest"
+            context += web_search("ISM Services PMI latest actual previous month") + "\n\n"
+            context += web_search("ISM Services PMI next release date forecast consensus") + "\n\n"
         elif "manufactur" in msg:
-            context += get_fred_data("ism manufacturing pmi") + "\n\n"
-            search_query = "ISM Manufacturing PMI forecast consensus actual latest"
+            context += web_search("ISM Manufacturing PMI latest actual previous month") + "\n\n"
+            context += web_search("ISM Manufacturing PMI next release date forecast consensus") + "\n\n"
         else:
-            context += get_fred_data("ism manufacturing pmi") + "\n\n"
-            context += get_fred_data("ism services pmi") + "\n\n"
-            search_query = "ISM Manufacturing Services PMI forecast consensus actual latest"
-        context += web_search(search_query) + "\n\n"
+            context += web_search("ISM Manufacturing PMI latest value previous month") + "\n\n"
+            context += web_search("ISM Services PMI latest value previous month") + "\n\n"
+            context += web_search("ISM PMI next release date forecast consensus") + "\n\n"
 
     # FRED / Economic data detection
     fred_keywords = [
